@@ -1,0 +1,86 @@
+# Ziwei Chart（紫微知道）· 懒猫 LPK V2 运行清单
+#
+# 形态：纯静态 SPA（Vite/React 构建产物），由平台以 file:// 路由直接分发，
+# 无服务容器、无数据库、无应用账号。
+#
+# 注入说明：
+# 1. lazycat-file-bridge：官方《自动拦截文件选择器》要求的同源文件桥（request 阶段），
+#    让「保存图片」写网盘（含他人共享目录）时能按 owner 切目录。照抄官方示例。
+# 2. zwc-strip-conditional-headers / zwc-html-no-store：HTML 缓存修正。静态页自带
+#    ETag/Last-Modified 时，客户端可能用条件请求拿到 304 复用旧页面，
+#    导致平台注入不生效；去掉条件头并输出 no-store 保证每次拿到完整页面。
+# 3. open-save-chooser：官方网盘文件选择器（browser 阶段），接管
+#    带 download 属性的 data:/blob: 下载（分享卡片「保存图片」即此形态）。
+application:
+  subdomain: ziwei-chart
+  routes:
+    - /=file:///lzcapp/pkg/content/dist
+  injects:
+    # ── 网盘文件桥（request 阶段，官方《自动拦截文件选择器》专题）───────────
+    - id: lazycat-file-bridge
+      'on': request
+      auth_required: false
+      when:
+        - /__lazycat_file_bridge/*
+      do:
+        - src: |
+            const bridgePrefix = "/__lazycat_file_bridge";
+            const requestHost = String(ctx.request.host || "").split(":")[0].toLowerCase();
+            const firstDot = requestHost.indexOf(".");
+            const method = String(ctx.request.method || "").toUpperCase();
+            if (firstDot <= 0 || !requestHost.endsWith(".heiyu.space") ||
+                !["GET", "HEAD", "PUT"].includes(method)) {
+              ctx.response.send(["GET", "HEAD", "PUT"].includes(method) ? 400 : 405,
+                "Invalid LazyCat file bridge request");
+              return;
+            }
+            const boxDomain = requestHost.slice(firstDot + 1);
+            ctx.headers.del("Origin");
+            ctx.headers.del("Referer");
+            ctx.proxy.to("https://file." + boxDomain, {
+              path: "/files/home" + ctx.request.path.slice(bridgePrefix.length),
+              query: ctx.request.raw_query,
+              use_target_host: true,
+              timeout_ms: 120000,
+              on_fail: "error",
+            });
+    # ── HTML 缓存修正：request 阶段去掉条件请求头（只有 HTML 请求需要）──────
+    - id: zwc-strip-conditional-headers
+      'on': request
+      auth_required: false
+      when:
+        - /*
+      do: |
+        var accept = String(ctx.headers.get("Accept") || "");
+        if (accept.indexOf("text/html") < 0) return;
+        ctx.headers.del("If-None-Match");
+        ctx.headers.del("If-Modified-Since");
+    # ── HTML 缓存修正：response 阶段对 HTML 输出 no-store 并去掉 ETag ────────
+    - id: zwc-html-no-store
+      'on': response
+      auth_required: false
+      when:
+        - /*
+      do: |
+        if (ctx.status !== 200) return;
+        var ct = String(ctx.headers.get("Content-Type") || "");
+        if (ct.indexOf("text/html") < 0) return;
+        ctx.headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+        ctx.headers.del("ETag");
+        ctx.headers.del("Last-Modified");
+    # ── 官方网盘文件选择器（browser 阶段）────────────────────────────────────
+    - id: open-save-chooser
+      'on': browser
+      when:
+        - /*
+      do:
+        - src: file:///lzcapp/pkg/content/lazycat-injects/lzc-file-chooser-inject.js
+          params:
+            diskRoot: /_lzc/files/home
+            fileBridgeRoot: /__lazycat_file_bridge
+            fallbackMime: application/octet-stream
+            locale: auto
+            hooks:
+              fileSystemAccess: true
+              fileInput: true
+              downloadAnchor: true
